@@ -286,6 +286,7 @@
             box-shadow: 4px 4px 0 0 #000;
             font-family: 'Courier New', monospace;
             pointer-events: auto;
+            user-select: none;
         }
 
         .upload-btn:active {
@@ -357,6 +358,11 @@
             cursor: pointer;
             pointer-events: auto;
             position: relative;
+            user-select: none;
+        }
+
+        .timeline-bar:active {
+            cursor: grabbing;
         }
 
         .timeline-fill {
@@ -428,6 +434,11 @@
             cursor: pointer;
             pointer-events: auto;
             position: relative;
+            user-select: none;
+        }
+
+        .volume-bar:active {
+            cursor: grabbing;
         }
 
         .volume-fill {
@@ -553,6 +564,84 @@
         let repeat = 'off'; // 'off', 'all', 'one'
         let volume = 0.7;
 
+        // IndexedDB for storing audio files
+        let db = null;
+
+        function initDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open('PixelIpodDB', 1);
+                
+                request.onerror = () => reject(request.error);
+                request.onsuccess = () => {
+                    db = request.result;
+                    resolve(db);
+                };
+                
+                request.onupgradeneeded = (e) => {
+                    const database = e.target.result;
+                    if (!database.objectStoreNames.contains('music')) {
+                        database.createObjectStore('music', { keyPath: 'id', autoIncrement: true });
+                    }
+                };
+            });
+        }
+
+        // Load saved music from IndexedDB on startup
+        async function loadSavedMusic() {
+            try {
+                await initDB();
+                
+                const transaction = db.transaction(['music'], 'readonly');
+                const objectStore = transaction.objectStore('music');
+                const request = objectStore.getAll();
+                
+                request.onsuccess = () => {
+                    const savedTracks = request.result;
+                    if (savedTracks && savedTracks.length > 0) {
+                        // Convert saved blobs back to URLs
+                        musicLibrary = savedTracks.map(track => ({
+                            title: track.title,
+                            artist: track.artist,
+                            url: URL.createObjectURL(track.blob),
+                            duration: track.duration,
+                            file: track.blob
+                        }));
+                        
+                        renderPlaylist();
+                    }
+                };
+            } catch (err) {
+                console.error('Error loading saved music:', err);
+            }
+        }
+
+        // Save music library to IndexedDB
+        async function saveMusicLibrary() {
+            try {
+                if (!db) await initDB();
+                
+                // Clear existing tracks
+                const clearTransaction = db.transaction(['music'], 'readwrite');
+                const clearStore = clearTransaction.objectStore('music');
+                clearStore.clear();
+                
+                // Save all tracks
+                const transaction = db.transaction(['music'], 'readwrite');
+                const objectStore = transaction.objectStore('music');
+                
+                for (const track of musicLibrary) {
+                    objectStore.add({
+                        title: track.title,
+                        artist: track.artist,
+                        duration: track.duration,
+                        blob: track.file
+                    });
+                }
+            } catch (err) {
+                console.error('Error saving music library:', err);
+            }
+        }
+
         // Color palette
         const colors = [
             { main: '#e8b4d9', shadow1: '#d89cc7', shadow2: '#c884b5', shadow3: '#b86ca3' }, // Pink
@@ -593,11 +682,18 @@
                 if (file.type.startsWith('audio/')) {
                     const url = URL.createObjectURL(file);
                     
-                    // Try to extract metadata
+                    // Try to extract metadata with timeout
                     const audio = new Audio(url);
-                    await new Promise(resolve => {
-                        audio.addEventListener('loadedmetadata', resolve, { once: true });
-                    });
+                    try {
+                        await Promise.race([
+                            new Promise(resolve => {
+                                audio.addEventListener('loadedmetadata', resolve, { once: true });
+                            }),
+                            new Promise(resolve => setTimeout(resolve, 2000)) // 2 second timeout
+                        ]);
+                    } catch (err) {
+                        console.log('Metadata load timeout, using defaults');
+                    }
 
                     // Extract title from filename (remove extension)
                     let title = file.name.replace(/\.[^/.]+$/, '');
@@ -614,13 +710,14 @@
                         title: title,
                         artist: artist,
                         url: url,
-                        duration: audio.duration,
+                        duration: audio.duration || 0,
                         file: file
                     });
                 }
             }
 
             if (musicLibrary.length > 0) {
+                saveMusicLibrary(); // Save to localStorage
                 renderPlaylist();
             } else {
                 screenInner.innerHTML = `
@@ -659,8 +756,23 @@
                             </div>
                         `;
                     }).join('')}
+                    <div style="text-align: center; padding: 8px; margin-top: 8px;">
+                        <button class="upload-btn" style="padding: 8px 16px; font-size: 11px; margin: 0;" id="addMoreBtn">+ Add More Music</button>
+                    </div>
                 </div>
             `;
+
+            // Add click handler for "Add More Music" button
+            setTimeout(() => {
+                const addMoreBtn = document.getElementById('addMoreBtn');
+                if (addMoreBtn) {
+                    addMoreBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        sounds.select();
+                        fileInput.click();
+                    });
+                }
+            }, 0);
 
             scrollToSelected();
         }
@@ -719,11 +831,13 @@
                 const timelineBar = document.getElementById('timelineBar');
                 if (timelineBar) {
                     timelineBar.addEventListener('click', handleTimelineClick);
+                    timelineBar.addEventListener('mousedown', handleTimelineMouseDown);
                 }
 
                 const volumeBar = document.getElementById('volumeBar');
                 if (volumeBar) {
                     volumeBar.addEventListener('click', handleVolumeClick);
+                    volumeBar.addEventListener('mousedown', handleVolumeMouseDown);
                 }
 
                 const shuffleBtn = document.getElementById('shuffleBtn');
@@ -782,6 +896,36 @@
             updateNowPlayingProgress();
         }
 
+        // Draggable timeline functionality
+        let isDraggingTimeline = false;
+        
+        function handleTimelineMouseDown(e) {
+            isDraggingTimeline = true;
+            handleTimelineDrag(e);
+            e.preventDefault();
+        }
+
+        function handleTimelineDrag(e) {
+            if (!isDraggingTimeline || !currentAudio) return;
+            
+            const bar = document.getElementById('timelineBar');
+            if (!bar) return;
+            
+            const rect = bar.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const percentage = Math.max(0, Math.min(1, clickX / rect.width));
+            
+            currentAudio.currentTime = percentage * currentAudio.duration;
+            updateNowPlayingProgress();
+        }
+
+        function handleTimelineMouseUp() {
+            if (isDraggingTimeline) {
+                sounds.click();
+            }
+            isDraggingTimeline = false;
+        }
+
         function handleVolumeClick(e) {
             const bar = e.currentTarget;
             const rect = bar.getBoundingClientRect();
@@ -798,6 +942,43 @@
             if (volumeFill) {
                 volumeFill.style.width = (volume * 100) + '%';
             }
+        }
+
+        // Draggable volume functionality
+        let isDraggingVolume = false;
+        
+        function handleVolumeMouseDown(e) {
+            isDraggingVolume = true;
+            handleVolumeDrag(e);
+            e.preventDefault();
+        }
+
+        function handleVolumeDrag(e) {
+            if (!isDraggingVolume) return;
+            
+            const bar = document.getElementById('volumeBar');
+            if (!bar) return;
+            
+            const rect = bar.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const percentage = Math.max(0, Math.min(1, clickX / rect.width));
+            
+            volume = percentage;
+            if (currentAudio) {
+                currentAudio.volume = volume;
+            }
+            
+            const volumeFill = document.getElementById('volumeFill');
+            if (volumeFill) {
+                volumeFill.style.width = (volume * 100) + '%';
+            }
+        }
+
+        function handleVolumeMouseUp() {
+            if (isDraggingVolume) {
+                sounds.click();
+            }
+            isDraggingVolume = false;
         }
 
         function updateNowPlayingProgress() {
@@ -975,15 +1156,9 @@
             if (repeat === 'one') {
                 currentAudio.currentTime = 0;
                 currentAudio.play();
-            } else if (repeat === 'all') {
+            } else if (repeat === 'all' || repeat === 'off') {
+                // Play next track for both 'all' and when repeat is off
                 playNextTrack();
-            } else {
-                isPlaying = false;
-                if (viewMode === 'playlist') {
-                    renderPlaylist();
-                } else {
-                    renderNowPlaying();
-                }
             }
         }
 
@@ -1089,10 +1264,12 @@
             playPreviousTrack();
         });
 
-        // Color changing by clicking iPod body
+        // Color changing by clicking iPod body (but NOT the screen)
         ipod.addEventListener('click', (e) => {
-            // Don't change color if clicking on interactive elements
-            if (e.target.closest('.click-wheel') || e.target.closest('.upload-btn')) {
+            // Don't change color if clicking on interactive elements OR the screen
+            if (e.target.closest('.click-wheel') || 
+                e.target.closest('.upload-btn') || 
+                e.target.closest('.screen')) {
                 return;
             }
             
@@ -1100,12 +1277,29 @@
         });
 
         ipod.addEventListener('touchend', (e) => {
-            // Don't change color if touching interactive elements
-            if (e.target.closest('.click-wheel') || e.target.closest('.upload-btn')) {
+            // Don't change color if touching interactive elements OR the screen
+            if (e.target.closest('.click-wheel') || 
+                e.target.closest('.upload-btn') || 
+                e.target.closest('.screen')) {
                 return;
             }
             
             changeColor();
+        });
+
+        // Global mouse event listeners for dragging sliders
+        document.addEventListener('mousemove', (e) => {
+            if (isDraggingTimeline) {
+                handleTimelineDrag(e);
+            }
+            if (isDraggingVolume) {
+                handleVolumeDrag(e);
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            handleTimelineMouseUp();
+            handleVolumeMouseUp();
         });
 
         function changeColor() {
@@ -1149,6 +1343,9 @@
                 fileInput.dispatchEvent(event);
             }
         });
+
+        // Initialize - load saved music library
+        loadSavedMusic();
     </script>
 </body>
 </html>
